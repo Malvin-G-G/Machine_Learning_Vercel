@@ -25,7 +25,7 @@ type Models = Partial<Record<ModelKey, tf.GraphModel>>;
 type Results = Partial<Record<ModelKey, PredictionResult[]>>;
 
 const steps = [
-  { title: "Capture", description: "Upload or take a photo" },
+  { title: "Capture", description: "Take or upload an image" },
   { title: "Enhance", description: "Crop and apply filters" },
   { title: "Resize", description: "Prepare image for AI" },
   { title: "Analyze", description: "Classify your image" },
@@ -48,7 +48,6 @@ function App() {
   const [showCropper, setShowCropper] = useState(false);
 
   const [step, setStep] = useState<Step>(0);
-  const [phase, setPhase] = useState<"idle" | "out" | "in">("idle");
 
   const [results, setResults] = useState<Results | null>(null);
   const [predicting, setPredicting] = useState(false);
@@ -276,26 +275,16 @@ function App() {
     Boolean(results),
   ][step];
 
-  // Glitch transition: glitch out -> swap panel -> glitch in
-  function goTo(target: Step) {
-    if (phase !== "idle" || target === step) return;
-
-    setPhase("out");
-    setTimeout(() => {
-      setStep(target);
-      setPhase("in");
-      setTimeout(() => setPhase("idle"), 420);
-    }, 380);
-  }
-
   function nextStep() {
     if (!canContinue || step === 3) return;
-    goTo((step + 1) as Step);
+
+    setStep((current) => (current + 1) as Step);
   }
 
   function previousStep() {
     if (step === 0) return;
-    goTo((step - 1) as Step);
+
+    setStep((current) => (current - 1) as Step);
   }
 
   function restart() {
@@ -304,7 +293,7 @@ function App() {
     setResized(null);
     setResults(null);
     setShowCropper(false);
-    goTo(0);
+    setStep(0);
   }
 
   return (
@@ -362,8 +351,7 @@ function App() {
         </div>
 
         {/* Main wizard card */}
-        <div className={`wizard-card glitch-${phase}`}>
-          <div className='glitch-overlay' aria-hidden />
+        <div className='wizard-card'>
           <div className='card-heading'>
             <div>
               <span className='step-caption'>STEP 0{step + 1} OF 04</span>
@@ -381,7 +369,7 @@ function App() {
               <div className='step-content'>
                 <div className='content-intro'>
                   <h3>Start with your image</h3>
-                  <p>Upload an image file (PNG, JPG, WEBP, GIF, BMP, AVIF, ...) or use your camera.</p>
+                  <p>Use your camera to capture an image for classification.</p>
                 </div>
 
                 <div className='camera-container'>
@@ -641,7 +629,7 @@ function App() {
             <button
               className='back-button'
               onClick={previousStep}
-              disabled={step === 0 || phase !== 'idle'}
+              disabled={step === 0}
             >
               ← Back
             </button>
@@ -652,7 +640,7 @@ function App() {
               <button
                 className='primary-button continue-button'
                 onClick={nextStep}
-                disabled={!canContinue || phase !== 'idle'}
+                disabled={!canContinue}
               >
                 Continue →
               </button>

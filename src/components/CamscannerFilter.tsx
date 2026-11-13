@@ -79,8 +79,8 @@ function showMat(cv: any, mat: any, canvas: HTMLCanvasElement) {
   else if (channels === 3) cv.cvtColor(mat, rgba, cv.COLOR_RGB2RGBA);
   else mat.copyTo(rgba);
 
-  canvas.width = rgba.cols;
-  canvas.height = rgba.rows;
+  if (canvas.width !== rgba.cols) canvas.width = rgba.cols;
+  if (canvas.height !== rgba.rows) canvas.height = rgba.rows;
   canvas
     .getContext("2d")!
     .putImageData(
@@ -141,10 +141,15 @@ function unsharp(cv: any, mat: any, amount = 0.6) {
   blur.delete();
 }
 
-/* ---------- Filter pipeline (shared by preview + final apply) ---------- */
+/* ---------- Two-stage pipeline: heavy stage is cached, slider stage is cheap ---------- */
 
-const PREVIEW_MAX = 720; // fast live preview
-const APPLY_MAX = 1600; // final output (model input is only 224px)
+const PREVIEW_MAX = 480; // live preview size (small = fast)
+const APPLY_MAX = 1600; // final output size (model only needs 224px)
+
+type BaseKind = "rgb" | "color" | "gray";
+
+const kindOf = (m: FilterMode): BaseKind =>
+  m === "original" ? "rgb" : m === "magic" || m === "magic_gray" ? "color" : "gray";
 
 function scaleCanvas(src: HTMLCanvasElement, max: number) {
   const k = Math.min(1, max / Math.max(src.width, src.height));
@@ -158,86 +163,60 @@ function scaleCanvas(src: HTMLCanvasElement, max: number) {
   return c;
 }
 
-function runFilter(
-  cv: any,
-  source: HTMLCanvasElement,
-  canvas: HTMLCanvasElement,
-  mode: FilterMode,
-  contrast: number,
-  threshold: number,
-) {
-    const mats: any[] = [];
-    const track = <T,>(m: T): T => {
-      mats.push(m);
-      return m;
-    };
+// Heavy stage (shadow/background normalization). Independent of sliders -> cached.
+function buildBase(cv: any, source: HTMLCanvasElement, kind: BaseKind): any {
+  const src = readMat(cv, source);
+  const rgb = new cv.Mat();
+  cv.cvtColor(src, rgb, cv.COLOR_RGBA2RGB);
+  src.delete();
+  if (kind === "rgb") return rgb;
 
-    try {
-      const src = track(readMat(cv, source));
-      const rgb = track(new cv.Mat());
-      cv.cvtColor(src, rgb, cv.COLOR_RGBA2RGB);
+  if (kind === "gray") {
+    const gray = new cv.Mat();
+    cv.cvtColor(rgb, gray, cv.COLOR_RGB2GRAY);
+    rgb.delete();
+    const norm = normalizeChannel(cv, gray);
+    gray.delete();
+    return norm;
+  }
 
-      let result: any;
+  const channels = new cv.MatVector();
+  cv.split(rgb, channels);
+  const normalized = new cv.MatVector();
+  for (let i = 0; i < 3; i++) {
+    const ch = channels.get(i);
+    normalized.push_back(normalizeChannel(cv, ch));
+    ch.delete();
+  }
+  const merged = new cv.Mat();
+  cv.merge(normalized, merged);
+  channels.delete();
+  normalized.delete();
+  rgb.delete();
+  return merged;
+}
 
-      if (mode === "original") {
-        result = rgb;
-      } else if (mode === "magic" || mode === "magic_gray") {
-        // Color: normalize each channel, then boost contrast and sharpen
-        const channels = track(new cv.MatVector());
-        cv.split(rgb, channels);
-
-        const normalized = track(new cv.MatVector());
-        for (let i = 0; i < 3; i++) {
-          const ch = channels.get(i);
-          normalized.push_back(normalizeChannel(cv, ch));
-          ch.delete();
-        }
-
-        const merged = track(new cv.Mat());
-        cv.merge(normalized, merged);
-
-        const boosted = track(new cv.Mat());
-        merged.convertTo(boosted, -1, contrast, -(contrast - 1) * 110);
-        unsharp(cv, boosted, 0.6);
-
-        if (mode === "magic_gray") {
-          const gray = track(new cv.Mat());
-          cv.cvtColor(boosted, gray, cv.COLOR_RGB2GRAY);
-          result = gray;
-        } else {
-          result = boosted;
-        }
-      } else {
-        // Grayscale-based modes
-        const gray = track(new cv.Mat());
-        cv.cvtColor(rgb, gray, cv.COLOR_RGB2GRAY);
-        const norm = track(normalizeChannel(cv, gray));
-
-        if (mode === "grayscale") {
-          const boosted = track(new cv.Mat());
-          norm.convertTo(boosted, -1, contrast, -(contrast - 1) * 110);
-          unsharp(cv, boosted, 0.6);
-          result = boosted;
-        } else {
-          // bw: crisp black & white
-          const bw = track(new cv.Mat());
-          cv.threshold(norm, bw, threshold, 255, cv.THRESH_BINARY);
-          result = bw;
-        }
-      }
-
-      showMat(cv, result, canvas);
-    } catch (err) {
-      console.error("OpenCV filter failed:", err);
-    } finally {
-      mats.forEach((m) => {
-        try {
-          m.delete();
-        } catch {
-          /* already freed */
-        }
-      });
-    }
+// Cheap stage (runs on every slider tick). Caller deletes the result.
+function finish(cv: any, base: any, mode: FilterMode, contrast: number, threshold: number): any {
+  const out = new cv.Mat();
+  if (mode === "original") {
+    base.copyTo(out);
+    return out;
+  }
+  if (mode === "bw") {
+    cv.threshold(base, out, threshold, 255, cv.THRESH_BINARY);
+    return out;
+  }
+  const boosted = new cv.Mat();
+  base.convertTo(boosted, -1, contrast, -(contrast - 1) * 110);
+  unsharp(cv, boosted, 0.6);
+  if (mode === "magic_gray") {
+    cv.cvtColor(boosted, out, cv.COLOR_RGB2GRAY);
+    boosted.delete();
+    return out;
+  }
+  out.delete();
+  return boosted;
 }
 
 /* ---------- Component ---------- */
@@ -249,6 +228,22 @@ export default function CamScannerFilter({
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const sourceRef = useRef<HTMLCanvasElement | null>(null);
   const previewSrcRef = useRef<HTMLCanvasElement | null>(null);
+  const baseRef = useRef<Partial<Record<BaseKind, any>>>({});
+  const [applying, setApplying] = useState(false);
+
+  function clearBases() {
+    Object.values(baseRef.current).forEach((m) => {
+      try {
+        m.delete();
+      } catch {
+        /* already freed */
+      }
+    });
+    baseRef.current = {};
+  }
+
+  // Free cached OpenCV memory on unmount
+  useEffect(() => clearBases, []);
 
   const [cvReady, setCvReady] = useState(false);
   const [imgReady, setImgReady] = useState(false);
@@ -285,6 +280,7 @@ export default function CamScannerFilter({
       src.getContext("2d")!.drawImage(img, 0, 0);
       sourceRef.current = src;
       previewSrcRef.current = scaleCanvas(src, PREVIEW_MAX);
+      clearBases();
       setImgReady(true);
     };
     img.onerror = () => console.error("Failed to load filter image:", image);
@@ -295,30 +291,69 @@ export default function CamScannerFilter({
     };
   }, [image]);
 
-  // Run the filter on the small preview (debounced so sliders stay smooth)
+  // Live preview: small image + cached heavy stage + one render per frame
   useEffect(() => {
-    if (!cvReady || !imgReady) return;
+    const canvas = canvasRef.current;
+    const preview = previewSrcRef.current;
+    const cv = cvRef.current;
+    if (!cvReady || !imgReady || !canvas || !preview || !cv) return;
 
-    const t = setTimeout(() => {
-      const canvas = canvasRef.current;
-      const source = previewSrcRef.current;
-      const cv = cvRef.current;
-      if (canvas && source && cv) {
-        runFilter(cv, source, canvas, mode, contrast, threshold);
+    const id = requestAnimationFrame(() => {
+      let result: any;
+      try {
+        const kind = kindOf(mode);
+        if (!baseRef.current[kind]) baseRef.current[kind] = buildBase(cv, preview, kind);
+        result = finish(cv, baseRef.current[kind], mode, contrast, threshold);
+        showMat(cv, result, canvas);
+      } catch (err) {
+        console.error("OpenCV filter failed:", err);
+      } finally {
+        try {
+          result?.delete();
+        } catch {
+          /* already freed */
+        }
       }
-    }, 80);
+    });
 
-    return () => clearTimeout(t);
+    return () => cancelAnimationFrame(id);
   }, [cvReady, imgReady, mode, contrast, threshold]);
 
+  // Final output: run the full pipeline once at higher resolution
   function applyFilter() {
     const cv = cvRef.current;
     const source = sourceRef.current;
-    if (!cv || !source) return;
+    if (!cv || !source || applying) return;
 
-    const out = document.createElement("canvas");
-    runFilter(cv, scaleCanvas(source, APPLY_MAX), out, mode, contrast, threshold);
-    out.toBlob((blob) => blob && onApply(blob), "image/jpeg", 0.95);
+    setApplying(true);
+    setTimeout(() => {
+      let base: any;
+      let result: any;
+      try {
+        base = buildBase(cv, scaleCanvas(source, APPLY_MAX), kindOf(mode));
+        result = finish(cv, base, mode, contrast, threshold);
+        const out = document.createElement("canvas");
+        showMat(cv, result, out);
+        out.toBlob(
+          (blob) => {
+            setApplying(false);
+            if (blob) onApply(blob);
+          },
+          "image/jpeg",
+          0.95,
+        );
+      } catch (err) {
+        console.error("Apply failed:", err);
+        setApplying(false);
+      } finally {
+        try {
+          base?.delete();
+          result?.delete();
+        } catch {
+          /* already freed */
+        }
+      }
+    }, 30);
   }
 
   return (
@@ -472,7 +507,7 @@ export default function CamScannerFilter({
                 type='range'
                 min='1'
                 max='2'
-                step='0.05'
+                step='0.01'
                 value={contrast}
                 onChange={(e) => setContrast(Number(e.target.value))}
                 style={
@@ -532,9 +567,9 @@ export default function CamScannerFilter({
           type='button'
           className='apply-button'
           onClick={applyFilter}
-          disabled={!cvReady || !imgReady}
+          disabled={!cvReady || !imgReady || applying}
         >
-          Apply Filter
+          {applying ? "Processing..." : "Apply Filter"}
           <span>→</span>
         </button>
       </footer>
